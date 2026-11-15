@@ -1,0 +1,23 @@
+# 本地凭据与运行时产物，绝不提交
+secrets.dat
+config.json
+portal.log
+portal.log.*
+portal.pid
+
+# 编译产物
+*.exe
+*.dll
+*.test
+*.out
+
+# Go
+.gocache/
+gopath/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

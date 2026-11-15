@@ -1,0 +1,1028 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unicode/utf16"
+	"unsafe"
+)
+
+const (
+	VERSION = "1.0.0"
+	cfgFile = "config.json"
+	secFile = "secrets.dat"
+	logFile = "portal.log"
+	pidFile = "portal.pid"
+	logMax  = 512 * 1024
+	appID   = "CampusPortal"
+)
+
+// ------------------------------------------------------------------ 配置
+
+type Config struct {
+	User string `json:"user"`
+
+	// 登录接口（用域名，TLS 证书按域名校验）
+	Portal string `json:"portal"`
+
+	// 门户真实 IP（可选，推荐填）。
+	// 门户通常是内网地址，而 Clash / mihomo 一类代理的 TUN + fake-ip 模式
+	// 会把域名解析成 198.18.x.x 的假地址，登录请求就打不到门户。
+	// 填了真实 IP 就固定直连它，SNI 和证书校验仍按域名走。留空则走系统解析。
+	PortalIP string `json:"portal_ip"`
+
+	// 绑定本机哪个 IPv4 作为源地址去连门户（留空则在运行时自动挑选同网段地址）。
+	// 作用：把登录流量钉在校园网网卡上，绕开 Clash 的 TUN 虚拟网卡。
+	BindLocalIP string `json:"bind_local_ip"`
+
+	ProbeURLs  []string `json:"probe_urls"`
+	ProbeTexts []string `json:"probe_expect"`
+
+	Interval   int `json:"interval_sec"`
+	Timeout    int `json:"timeout_sec"`
+	MaxBackoff int `json:"max_backoff_sec"`
+}
+
+func defaultConfig() Config {
+	return Config{
+		User: "",
+
+		// 门户地址因校而异，留空，由 -setup 询问后写入 config.json。
+		Portal:   "",
+		PortalIP: "",
+		ProbeURLs: []string{
+			"http://www.baidu.com/",
+			"http://www.msftconnecttest.com/connecttest.txt",
+		},
+		ProbeTexts: []string{
+			"百度一下",
+			"Microsoft Connect Test",
+		},
+		Interval:   1800,
+		Timeout:    8,
+		MaxBackoff: 300,
+	}
+}
+
+// ------------------------------------------------------------------ 日志
+
+type Logger struct {
+	mu   sync.Mutex
+	path string
+}
+
+func (l *Logger) log(level, format string, a ...interface{}) {
+	line := fmt.Sprintf("%s [%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), level, fmt.Sprintf(format, a...))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if fi, err := os.Stat(l.path); err == nil && fi.Size() > logMax {
+		_ = os.Remove(l.path + ".1")
+		_ = os.Rename(l.path, l.path+".1")
+	}
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(line)
+	_ = f.Close()
+}
+
+func (l *Logger) Info(f string, a ...interface{})  { l.log("INFO", f, a...) }
+func (l *Logger) Warn(f string, a ...interface{})  { l.log("WARN", f, a...) }
+func (l *Logger) Error(f string, a ...interface{}) { l.log("ERROR", f, a...) }
+
+// ------------------------------------------------------------------ Win32
+
+var (
+	kernel32             = syscall.NewLazyDLL("kernel32.dll")
+	crypt32              = syscall.NewLazyDLL("crypt32.dll")
+	procProtect          = crypt32.NewProc("CryptProtectData")
+	procUnprotect        = crypt32.NewProc("CryptUnprotectData")
+	procLocalFree        = kernel32.NewProc("LocalFree")
+	procCreateMutex      = kernel32.NewProc("CreateMutexW")
+	procGetConsoleMode   = kernel32.NewProc("GetConsoleMode")
+	procSetConsoleMode   = kernel32.NewProc("SetConsoleMode")
+	procAttachConsole    = kernel32.NewProc("AttachConsole")
+	procGetStdHandle     = kernel32.NewProc("GetStdHandle")
+	procGetFileType      = kernel32.NewProc("GetFileType")
+	procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
+	user32               = syscall.NewLazyDLL("user32.dll")
+	procShowWindow       = user32.NewProc("ShowWindow")
+)
+
+const (
+	stdOutputHandle      = ^uintptr(11) // -11
+	attachParentProcess  = ^uintptr(0)  // -1
+	fileTypeChar         = 1
+	fileTypePipe         = 3
+	fileTypeDisk         = 4
+	swHide               = 0
+)
+
+// ensureConsole 为 GUI 子系统程序按需接上控制台。
+// 程序编译成 -H windowsgui（后台运行时不弹黑框）；被 cmd 双击或命令行调用时，
+// 这里再附着到父进程的控制台，提示符和输出就正常了。
+// 如果 stdout 已被重定向到文件或管道，则保持原样不动。
+func ensureConsole() {
+	if h, _, _ := procGetStdHandle.Call(stdOutputHandle); h != 0 && h != ^uintptr(0) {
+		switch t, _, _ := procGetFileType.Call(h); t {
+		case fileTypeChar: // 已经是控制台
+			return
+		case fileTypePipe, fileTypeDisk: // 被重定向，保留
+			return
+		}
+	}
+	if r, _, _ := procAttachConsole.Call(attachParentProcess); r == 0 {
+		return // 没有父控制台（比如开机自启），正常静默运行
+	}
+	if f, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+		os.Stdout = f
+		os.Stderr = f
+	}
+	if f, err := os.OpenFile("CONIN$", os.O_RDWR, 0); err == nil {
+		os.Stdin = f
+	}
+}
+
+// hideConsoleWindow 兜底：万一进程仍带着控制台窗口，直接藏起来。
+func hideConsoleWindow() {
+	if h, _, _ := procGetConsoleWindow.Call(); h != 0 {
+		procShowWindow.Call(h, swHide)
+	}
+}
+
+type dataBlob struct {
+	cbData uint32
+	pbData *byte
+}
+
+func newBlob(d []byte) *dataBlob {
+	if len(d) == 0 {
+		return &dataBlob{}
+	}
+	return &dataBlob{cbData: uint32(len(d)), pbData: &d[0]}
+}
+
+func (b *dataBlob) bytes() []byte {
+	out := make([]byte, b.cbData)
+	if b.cbData > 0 && b.pbData != nil {
+		copy(out, unsafe.Slice(b.pbData, int(b.cbData)))
+	}
+	return out
+}
+
+func dpapiProtect(plain []byte) ([]byte, error) {
+	in := newBlob(plain)
+	var out dataBlob
+	r, _, e := procProtect.Call(uintptr(unsafe.Pointer(in)), 0, 0, 0, 0, 0, uintptr(unsafe.Pointer(&out)))
+	if r == 0 {
+		return nil, e
+	}
+	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData)))
+	return out.bytes(), nil
+}
+
+func dpapiUnprotect(enc []byte) ([]byte, error) {
+	in := newBlob(enc)
+	var out dataBlob
+	r, _, e := procUnprotect.Call(uintptr(unsafe.Pointer(in)), 0, 0, 0, 0, 0, uintptr(unsafe.Pointer(&out)))
+	if r == 0 {
+		return nil, e
+	}
+	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData)))
+	return out.bytes(), nil
+}
+
+// ------------------------------------------------------------------ RC4（复刻 H3C ac_portal 前端）
+
+// rc4Hex 等价于 logic_new.js 的 do_encrypt_rc4(src, passwd)：
+// key[i] = passwd.charCodeAt(i % passwd.length)，输出每字节 2 位小写 hex。
+func rc4Hex(src, passwd string) string {
+	if passwd == "" {
+		return src
+	}
+	keyU := utf16.Encode([]rune(passwd))
+	srcU := utf16.Encode([]rune(src))
+	sbox := make([]int, 256)
+	for i := 0; i < 256; i++ {
+		sbox[i] = i
+	}
+	j := 0
+	for i := 0; i < 256; i++ {
+		j = (j + sbox[i] + int(keyU[i%len(keyU)])) % 256
+		sbox[i], sbox[j] = sbox[j], sbox[i]
+	}
+	a, b := 0, 0
+	var sb strings.Builder
+	sb.Grow(len(srcU) * 2)
+	for _, cu := range srcU {
+		a = (a + 1) % 256
+		b = (b + sbox[a]) % 256
+		sbox[a], sbox[b] = sbox[b], sbox[a]
+		k := (sbox[a] + sbox[b]) % 256
+		sb.WriteString(fmt.Sprintf("%02x", (int(cu)^sbox[k])&0xFF))
+	}
+	return sb.String()
+}
+
+// ------------------------------------------------------------------ 源地址
+
+// localAddr 把连接钉在指定源 IPv4 上。必须用 Dialer.LocalAddr，
+// 不能用 RawConn + syscall.Bind —— Go 建的是 AF_INET6 双栈套接字，绑 IPv4 会报
+// "An invalid argument was supplied"。
+func localAddr(localIP string) net.Addr {
+	if localIP == "" {
+		return nil
+	}
+	ip := net.ParseIP(localIP).To4()
+	if ip == nil {
+		return nil
+	}
+	return &net.TCPAddr{IP: ip}
+}
+
+// autoBindIP 找本机与门户 IP 同 /8 段的 IPv4（即校园网网卡的地址）。
+func autoBindIP(portalIP string) string {
+	target := net.ParseIP(portalIP).To4()
+	if target == nil {
+		return ""
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	var cands []string
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := ifi.Addrs()
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipn.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			if ip[0] == 198 && ip[1] == 18 {
+				continue // Clash TUN 假地址
+			}
+			if ip[0] != target[0] {
+				continue
+			}
+			cands = append(cands, ip.String())
+		}
+	}
+	if len(cands) == 0 {
+		return ""
+	}
+	sort.Strings(cands)
+	return cands[0]
+}
+
+// ------------------------------------------------------------------ HTTP：一律直连
+
+func baseTransport(timeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy:                 nil, // 绝不使用系统/环境变量代理
+		DialContext:           (&net.Dialer{Timeout: timeout}).DialContext,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		DisableKeepAlives:     true,
+	}
+}
+
+// portalTransport 把连接钉到 targetIP + 指定源地址，SNI / 证书仍按域名校验。
+func portalTransport(targetIP, bindIP string, timeout time.Duration) *http.Transport {
+	tr := baseTransport(timeout)
+	d := &net.Dialer{Timeout: timeout, LocalAddr: localAddr(bindIP)}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if targetIP == "" {
+			return d.DialContext(ctx, network, addr)
+		}
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			port = "443"
+		}
+		return d.DialContext(ctx, network, net.JoinHostPort(targetIP, port))
+	}
+	return tr
+}
+
+func newClient(tr *http.Transport, timeout time.Duration) *http.Client {
+	return &http.Client{
+		Transport: tr,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("重定向次数过多")
+			}
+			return nil
+		},
+	}
+}
+
+// ------------------------------------------------------------------ 探测
+
+type prober struct {
+	cfg    Config
+	client *http.Client
+}
+
+func (p *prober) probe() (bool, string) {
+	var first string
+	for i, u := range p.cfg.ProbeURLs {
+		expect := ""
+		if i < len(p.cfg.ProbeTexts) {
+			expect = p.cfg.ProbeTexts[i]
+		}
+		ok, detail := p.probeOne(u, expect)
+		if ok {
+			return true, detail
+		}
+		if i == 0 {
+			first = detail
+		}
+	}
+	if first == "" {
+		first = "所有探测目标均失败"
+	}
+	return false, first
+}
+
+func (p *prober) probeOne(rawURL, expect string) (bool, string) {
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return false, "构造请求失败: " + err.Error()
+	}
+	req.Header.Set("Cache-Control", "no-cache, no-store")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return false, "连接失败: " + short(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32768))
+	if resp.StatusCode != 200 {
+		return false, fmt.Sprintf("%s 返回 HTTP %d（疑似被门户拦截）", hostOf(rawURL), resp.StatusCode)
+	}
+	text := string(body)
+	if expect != "" && !strings.Contains(text, expect) {
+		if strings.Contains(text, "ac_portal") || strings.Contains(text, "身份认证") {
+			return false, fmt.Sprintf("%s 被重定向到认证页", hostOf(rawURL))
+		}
+		return false, fmt.Sprintf("%s 内容不符（可能被劫持）", hostOf(rawURL))
+	}
+	return true, hostOf(rawURL) + " 可达"
+}
+
+func hostOf(u string) string {
+	if pu, err := url.Parse(u); err == nil {
+		return pu.Host
+	}
+	return u
+}
+
+func short(err error) string {
+	s := err.Error()
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
+}
+
+func truncate(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// ------------------------------------------------------------------ 登录
+
+type loginResp struct {
+	Success  bool   `json:"success"`
+	Msg      string `json:"msg"`
+	Action   string `json:"action"`
+	Pop      int    `json:"pop"`
+	UserName string `json:"userName"`
+	Location string `json:"location"`
+}
+
+// loginOnce 用给定的目标 IP 打一次登录接口。
+func loginOnce(cfg Config, user, pass, targetIP, bindIP string, timeout time.Duration) (bool, string, error) {
+	authTag := fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	form := url.Values{}
+	form.Set("opr", "pwdLogin")
+	form.Set("userName", user)
+	form.Set("pwd", rc4Hex(pass, authTag))
+	form.Set("auth_tag", authTag)
+	form.Set("rememberPwd", "1")
+
+	client := newClient(portalTransport(targetIP, bindIP, timeout), timeout)
+	req, err := http.NewRequest("POST", cfg.Portal, strings.NewReader(form.Encode()))
+	if err != nil {
+		return false, "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+
+	var lr loginResp
+	if err := json.Unmarshal(bytes.TrimSpace(body), &lr); err != nil {
+		return false, "响应非 JSON（可能被劫持）: " + truncate(string(body), 160), nil
+	}
+	if lr.Success {
+		if lr.Msg != "" {
+			return true, lr.Msg, nil
+		}
+		return true, "登录成功", nil
+	}
+	if lr.Msg == "" {
+		lr.Msg = "登录被拒绝（无返回消息）"
+	}
+	return false, lr.Msg, nil
+}
+
+// login 按“最稳妥到最宽松”的顺序尝试几种连法，取第一个拿到门户 JSON 应答的：
+//  1. 固定门户 IP + 绑定源地址（绕开 Clash TUN，最干净）
+//  2. 固定门户 IP + 不绑定（应对源地址挑选失准）
+//  3. 域名解析 + 不绑定（应对门户换了 IP）
+// 只要某一种拿到了 JSON（哪怕是“密码错误”），就立即返回，不再往下试。
+func login(cfg Config, user, pass string, timeout time.Duration) (bool, string) {
+	bindIP := cfg.BindLocalIP
+	if bindIP == "" && cfg.PortalIP != "" {
+		bindIP = autoBindIP(cfg.PortalIP)
+	}
+
+	type attempt struct {
+		name   string
+		target string
+		bind   string
+	}
+	var attempts []attempt
+	if cfg.PortalIP != "" {
+		if bindIP != "" {
+			attempts = append(attempts, attempt{"直连门户 IP + 绑定源地址", cfg.PortalIP, bindIP})
+		}
+		attempts = append(attempts, attempt{"直连门户 IP", cfg.PortalIP, ""})
+	}
+	attempts = append(attempts, attempt{"域名解析", "", ""})
+
+	var errs []string
+	for _, a := range attempts {
+		ok, msg, err := loginOnce(cfg, user, pass, a.target, a.bind, timeout)
+		if err == nil {
+			return ok, msg // 门户正常应答了，结论有效
+		}
+		errs = append(errs, a.name+"："+short(err))
+	}
+	return false, "连不上门户（" + strings.Join(errs, "；") + "）"
+}
+
+// ------------------------------------------------------------------ 文件
+
+func exeDir() string {
+	p, err := os.Executable()
+	if err != nil {
+		wd, _ := os.Getwd()
+		return wd
+	}
+	d := filepath.Dir(p)
+	if strings.Contains(strings.ToLower(d), "go-build") {
+		wd, _ := os.Getwd()
+		return wd
+	}
+	return d
+}
+
+func loadConfig(dir string) (Config, error) {
+	cfg := defaultConfig()
+	path := filepath.Join(dir, cfgFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			b, _ := json.MarshalIndent(cfg, "", "  ")
+			_ = os.WriteFile(path, b, 0o644)
+			return cfg, nil
+		}
+		return cfg, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("配置文件格式有误: %w", err)
+	}
+	d := defaultConfig()
+	if cfg.Portal == "" {
+		cfg.Portal = d.Portal
+	}
+	if len(cfg.ProbeURLs) == 0 {
+		cfg.ProbeURLs = d.ProbeURLs
+	}
+	if len(cfg.ProbeTexts) == 0 {
+		cfg.ProbeTexts = d.ProbeTexts
+	}
+	if cfg.Interval <= 0 {
+		cfg.Interval = d.Interval
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = d.Timeout
+	}
+	if cfg.MaxBackoff <= 0 {
+		cfg.MaxBackoff = d.MaxBackoff
+	}
+	return cfg, nil
+}
+
+func saveConfig(dir string, cfg Config) error {
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, cfgFile), b, 0o644)
+}
+
+func readPassword(dir string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, secFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", errors.New("还没保存密码，请先双击 1-设置账号密码.cmd")
+		}
+		return "", err
+	}
+	plain, err := dpapiUnprotect(b)
+	if err != nil {
+		return "", fmt.Errorf("密码解密失败（换了 Windows 用户或电脑后需要重新设置）: %w", err)
+	}
+	return string(plain), nil
+}
+
+func writePassword(dir, pw string) error {
+	enc, err := dpapiProtect([]byte(pw))
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, secFile), enc, 0o600)
+}
+
+// readHidden 读一行输入并在输入过程中关闭回显。
+// 注意：必须用一个 Reader 读完所有输入。bufio 会预读缓冲区，
+// 若中途换了新 Reader，前面已预读的行会丢，导致后续提示读到空值。
+func readHidden(rd *bufio.Reader) (string, error) {
+	h := syscall.Handle(os.Stdin.Fd())
+	var mode uint32
+	okMode, _, _ := procGetConsoleMode.Call(uintptr(h), uintptr(unsafe.Pointer(&mode)))
+	if okMode != 0 {
+		const enableEcho = 0x0004
+		procSetConsoleMode.Call(uintptr(h), uintptr(mode&^enableEcho))
+		defer func() {
+			procSetConsoleMode.Call(uintptr(h), uintptr(mode))
+			fmt.Println()
+		}()
+	}
+	line, err := rd.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func singleInstance() bool {
+	name, _ := syscall.UTF16PtrFromString("Local\\" + appID + "-Daemon")
+	h, _, e := procCreateMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
+	if h == 0 {
+		fmt.Println("创建互斥体失败:", e)
+		return false
+	}
+	const errAlreadyExists = 183
+	if se, ok := e.(syscall.Errno); ok && se == errAlreadyExists {
+		return false
+	}
+	return true
+}
+
+func writePID(dir string) {
+	_ = os.WriteFile(filepath.Join(dir, pidFile), []byte(strconv.Itoa(os.Getpid())), 0o644)
+}
+
+func backoff(cfg Config, n int) int {
+	w := 10 * n
+	if w > cfg.MaxBackoff {
+		w = cfg.MaxBackoff
+	}
+	if w < 10 {
+		w = 10
+	}
+	return w
+}
+
+// ------------------------------------------------------------------ 开机自启
+
+// installAutostart 直接把自己写进当前用户的 Run 键（不需要管理员权限）。
+// 本程序编译为 windowsgui 子系统，正常运行时没有控制台窗口，
+// 所以不需要 vbs / wscript 之类的中间层。
+func installAutostart(dir string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if filepath.IsAbs(exe) {
+		dir = filepath.Dir(exe)
+		exe = filepath.Join(dir, filepath.Base(exe))
+	}
+	quoted := `"` + exe + `"`
+	cmd := regAddCmd(quoted)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// regAddCmd 通过 cmd /c 调用 reg，避免 Go 直接传参时的引号处理差异。
+func regAddCmd(value string) *exec.Cmd {
+	line := fmt.Sprintf(`reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v %s /t REG_SZ /d "%s" /f`, appID, value)
+	return exec.Command("cmd", "/c", line)
+}
+
+func uninstallAutostart() error {
+	cmd := exec.Command("cmd", "/c", `reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v `+appID+` /f`)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		s := string(out)
+		if strings.Contains(s, "unable to find") || strings.Contains(s, "找不到") ||
+			strings.Contains(s, "系统找不到") {
+			return nil // 本来就没设置
+		}
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(s))
+	}
+	return nil
+}
+
+// ------------------------------------------------------------------ main
+
+func main() {
+	var (
+		setupFlag  = flag.Bool("setup", false, "设置学号与密码并测试登录")
+		onceFlag   = flag.Bool("once", false, "只探测/登录一次，不常驻")
+		diagFlag   = flag.Bool("diag", false, "输出诊断信息")
+		forceFlag  = flag.Bool("force", false, "配合 -diag：即使在线也强制调一次登录接口")
+		installFlg = flag.Bool("install", false, "设置开机自动启动")
+		uninstFlg  = flag.Bool("uninstall", false, "取消开机自动启动")
+		userFlag   = flag.String("u", "", "配合 -setup：学号")
+		pwFlag     = flag.String("pw", "", "配合 -setup：密码（不推荐，会留在命令历史）")
+		ipFlag     = flag.String("ip", "", "配合 -setup：门户真实 IP")
+		bindFlag   = flag.String("bind", "", "配合 -setup：源地址")
+		portalFlag = flag.String("portal", "", "配合 -setup：登录接口完整地址")
+	)
+	flag.Parse()
+
+	// 交互类命令需要控制台输出；守护模式则隐藏窗口静默运行。
+	if *setupFlag || *diagFlag || *onceFlag || *installFlg || *uninstFlg {
+		ensureConsole()
+	} else {
+		hideConsoleWindow()
+	}
+
+	dir := exeDir()
+	_ = os.Chdir(dir)
+
+	if *uninstFlg {
+		if err := uninstallAutostart(); err != nil {
+			fmt.Println("取消失败:", err)
+			return
+		}
+		fmt.Println("已取消开机自启。")
+		return
+	}
+	if *installFlg {
+		if err := installAutostart(dir); err != nil {
+			fmt.Println("自动写入启动项失败:", err)
+			fmt.Println()
+			fmt.Println("本机装了联想电脑管家，它会把注册表 Run 项挪进 LenovoDisabled 子键，")
+			fmt.Println("所以命令行方式写自启在这台机器上不可用。")
+			fmt.Println("→ 请改为双击 3-设为开机自启.cmd（它往「启动」文件夹放快捷方式，联想管家不管那里）。")
+			return
+		}
+		fmt.Println("已设置开机自启（登录 Windows 后自动在后台运行，无窗口）。")
+		return
+	}
+
+	log := &Logger{path: filepath.Join(dir, logFile)}
+	cfg, err := loadConfig(dir)
+	if err != nil {
+		fmt.Println("读取配置失败:", err)
+		return
+	}
+	if strings.TrimSpace(cfg.Portal) == "" && !*setupFlag {
+		fmt.Println("还没配置登录接口，请先双击 1-设置账号密码.cmd")
+		return
+	}
+
+	if *setupFlag {
+		doSetup(dir, cfg, *userFlag, *pwFlag, *ipFlag, *bindFlag, *portalFlag)
+		return
+	}
+
+	pass, err := readPassword(dir)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if strings.TrimSpace(cfg.User) == "" {
+		fmt.Println("还没设置学号，请先双击 1-设置账号密码.cmd")
+		return
+	}
+	cfg.User = strings.TrimSpace(cfg.User)
+
+	if cfg.BindLocalIP == "" && cfg.PortalIP != "" {
+		cfg.BindLocalIP = autoBindIP(cfg.PortalIP)
+	}
+
+	timeout := time.Duration(cfg.Timeout) * time.Second
+	p := &prober{cfg: cfg, client: newClient(baseTransport(timeout), timeout)}
+
+	if *diagFlag {
+		runDiag(p, cfg, pass, *forceFlag)
+		return
+	}
+	if *onceFlag {
+		ok, detail := p.probe()
+		fmt.Println("探测:", detail)
+		if ok {
+			return
+		}
+		okLogin, msg := login(cfg, cfg.User, pass, timeout)
+		fmt.Println("登录:", msg)
+		if okLogin {
+			time.Sleep(2 * time.Second)
+			ok2, d2 := p.probe()
+			fmt.Println("复检:", ok2, d2)
+		}
+		return
+	}
+
+	if !singleInstance() {
+		return
+	}
+	writePID(dir)
+	defer os.Remove(filepath.Join(dir, pidFile))
+	daemon(p, cfg, pass, log)
+}
+
+func doSetup(dir string, cfg Config, userFlag, pwFlag, ipFlag, bindFlag, portalFlag string) {
+	fmt.Println("=== 校园网自动登录 · 初始化 ===")
+	rd := bufio.NewReader(os.Stdin)
+	ask := func(prompt, cur string) string {
+		if cur == "" {
+			cur = "未设置"
+		}
+		fmt.Printf("%s [当前: %s]: ", prompt, cur)
+		line, _ := rd.ReadString('\n')
+		return strings.TrimSpace(line)
+	}
+
+	portal := strings.TrimSpace(portalFlag)
+	if portal == "" && cfg.Portal == "" {
+		fmt.Println()
+		fmt.Println("请输入贵校校园网认证接口的完整地址。")
+		fmt.Println("通常就是你平时登录时浏览器地址栏里那个 login 页面，")
+		fmt.Println("例如：https://<认证服务器>/ac_portal/login.php")
+		portal = ask("登录接口", "")
+	}
+	if portal != "" {
+		if !strings.HasPrefix(portal, "http://") && !strings.HasPrefix(portal, "https://") {
+			fmt.Println("地址必须以 http:// 或 https:// 开头，已退出。")
+			return
+		}
+		cfg.Portal = portal
+	}
+	if cfg.Portal == "" {
+		fmt.Println("必须提供登录接口地址，已退出。")
+		return
+	}
+
+	user := strings.TrimSpace(userFlag)
+	if user == "" {
+		user = ask("学号", cfg.User)
+		if user == "" {
+			user = cfg.User
+		}
+	}
+	if user == "" {
+		fmt.Println("必须提供学号，已退出。")
+		return
+	}
+
+	pw := pwFlag
+	if pw == "" {
+		fmt.Print("密码（输入时不显示）: ")
+		var err error
+		pw, err = readHidden(rd)
+		if err != nil || pw == "" {
+			fmt.Println("密码为空，已退出。")
+			return
+		}
+	}
+
+	if ipFlag != "" {
+		cfg.PortalIP = strings.TrimSpace(ipFlag)
+	}
+	if bindFlag != "" {
+		cfg.BindLocalIP = strings.TrimSpace(bindFlag)
+	}
+	if cfg.BindLocalIP == "" && cfg.PortalIP != "" {
+		cfg.BindLocalIP = autoBindIP(cfg.PortalIP)
+	}
+
+	cfg.User = user
+	if err := saveConfig(dir, cfg); err != nil {
+		fmt.Println("保存配置失败:", err)
+		return
+	}
+	if err := writePassword(dir, pw); err != nil {
+		fmt.Println("保存密码失败:", err)
+		return
+	}
+	fmt.Println("已保存（密码用 Windows DPAPI 加密，只有本机本用户能解）。")
+	if cfg.PortalIP != "" {
+		fmt.Println("门户直连 IP:", cfg.PortalIP)
+	}
+	if cfg.BindLocalIP != "" {
+		fmt.Println("绑定源地址:", cfg.BindLocalIP)
+	}
+
+	log := &Logger{path: filepath.Join(dir, logFile)}
+	timeout := time.Duration(cfg.Timeout) * time.Second
+	p := &prober{cfg: cfg, client: newClient(baseTransport(timeout), timeout)}
+
+	fmt.Print("测试登录… ")
+	okLogin, msg := login(cfg, cfg.User, pw, timeout)
+	if !okLogin {
+		fmt.Println("失败 ✗", msg)
+		log.Error("setup 测试登录失败: %s", msg)
+		return
+	}
+	time.Sleep(2 * time.Second)
+	if ok2, d2 := p.probe(); ok2 {
+		fmt.Println("成功 ✓", d2)
+		log.Info("setup 测试登录成功")
+	} else {
+		fmt.Println("接口返回:", msg, "但探测仍失败:", d2)
+		log.Warn("setup 登录成功但探测失败: %s", d2)
+	}
+}
+
+func daemon(p *prober, cfg Config, pass string, log *Logger) {
+	log.Info("守护启动 v%s：账号 %s，间隔 %ds，门户 %s (%s)，源地址 %s",
+		VERSION, cfg.User, cfg.Interval, cfg.Portal, cfg.PortalIP, orDash(cfg.BindLocalIP))
+	timeout := time.Duration(cfg.Timeout) * time.Second
+	fails, authFails := 0, 0
+	sleep := func(sec int) { time.Sleep(time.Duration(sec) * time.Second) }
+
+	for {
+		ok, detail := p.probe()
+		if ok {
+			if fails > 0 {
+				log.Info("网络已恢复正常")
+			}
+			fails, authFails = 0, 0
+			sleep(cfg.Interval)
+			continue
+		}
+
+		fails++
+		log.Warn("探测失败(#%d)：%s", fails, detail)
+
+		sleep(3) // 二次确认，滤掉瞬时抖动
+		if ok2, _ := p.probe(); ok2 {
+			log.Info("二次探测通过，判为瞬时抖动，忽略")
+			fails = 0
+			sleep(cfg.Interval)
+			continue
+		}
+
+		okLogin, msg := login(cfg, cfg.User, pass, timeout)
+		if !okLogin {
+			authFails++
+			w := backoff(cfg, authFails)
+			log.Error("登录失败：%s（%d 秒后重试）", msg, w)
+			sleep(w)
+			continue
+		}
+
+		sleep(2)
+		if ok3, d3 := p.probe(); ok3 {
+			log.Info("自动登录成功（%s），网络已恢复", msg)
+			fails, authFails = 0, 0
+			sleep(cfg.Interval)
+		} else {
+			authFails++
+			w := backoff(cfg, authFails)
+			log.Warn("登录接口返回成功但探测仍失败（%s），%d 秒后重试", d3, w)
+			sleep(w)
+		}
+	}
+}
+
+func runDiag(p *prober, cfg Config, pass string, force bool) {
+	fmt.Println("=== 诊断 ===")
+	fmt.Println("版本:    ", VERSION)
+	fmt.Println("账号:    ", cfg.User)
+	fmt.Println("登录接口:", cfg.Portal)
+	fmt.Println("门户 IP: ", orDash(cfg.PortalIP))
+	fmt.Println("源地址:  ", orDash(cfg.BindLocalIP))
+	fmt.Println("探测目标:", strings.Join(cfg.ProbeURLs, " , "))
+	fmt.Printf("探测间隔: %d 秒\n", cfg.Interval)
+	fmt.Println("RC4 自检: ", rc4Hex("test", "1234"), "(应为 712c02db)")
+
+	ok, detail := p.probe()
+	fmt.Printf("连通性:   %v  %s\n", ok, detail)
+
+	fmt.Print("门户可达 … ")
+	if err := pingPortal(cfg); err != nil {
+		fmt.Println("不通:", err)
+		return
+	}
+	fmt.Println("OK")
+
+	if ok && !force {
+		fmt.Println("→ 当前在线，跳过登录测试（加 -force 可强制测一次）。")
+		return
+	}
+	okLogin, msg := login(cfg, cfg.User, pass, time.Duration(cfg.Timeout)*time.Second)
+	fmt.Printf("登录结果: %v  %s\n", okLogin, msg)
+	if okLogin {
+		time.Sleep(2 * time.Second)
+		ok2, d2 := p.probe()
+		fmt.Println("复检:    ", ok2, d2)
+	}
+}
+
+func pingPortal(cfg Config) error {
+	timeout := 6 * time.Second
+	pu, err := url.Parse(cfg.Portal)
+	if err != nil {
+		return err
+	}
+	host := cfg.PortalIP
+	if host == "" {
+		host = pu.Hostname()
+	}
+	port := pu.Port()
+	if port == "" {
+		port = "443"
+	}
+	bind := cfg.BindLocalIP
+	if bind == "" {
+		bind = autoBindIP(host)
+	}
+	d := &net.Dialer{Timeout: timeout, LocalAddr: localAddr(bind)}
+	conn, err := d.Dial("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "（未设置）"
+	}
+	return s
+}

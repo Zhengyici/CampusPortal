@@ -1,0 +1,16 @@
+# 换行与二进制约定
+# 注意：gitattributes 里后出现的规则覆盖前面的，所以默认规则写最上面。
+
+# 默认：进仓库统一 LF，检出时按平台
+* text=auto eol=lf
+
+# .cmd / .bat 必须是 CRLF + GBK，禁止 git 改写换行，
+# 否则 cmd 会报 "'XXX' is not recognized as an internal or external command"
+*.cmd -text
+*.bat -text
+
+# 二进制
+*.exe binary
+*.dll binary
+*.ico binary
+*.png binary
