@@ -19,6 +19,8 @@
 
 ## 这是什么
 
+> **直接下载**：去 [Releases](https://github.com/Zhengyici/CampusPortal/releases/latest) 拿 `CampusPortal.exe`（6 MB，免安装，不用装 Go）。
+
 很多学校的校园网（H3C `ac_portal`、锐捷 ePortal、深澜 srun 等）长时间连着会自己掉线，
 掉线之后必须打开浏览器、进认证页面、手动敲一遍学号和密码才能恢复上网。
 
