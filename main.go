@@ -123,11 +123,14 @@ var (
 	procGetConsoleMode   = kernel32.NewProc("GetConsoleMode")
 	procSetConsoleMode   = kernel32.NewProc("SetConsoleMode")
 	procAttachConsole    = kernel32.NewProc("AttachConsole")
+	procAllocConsole     = kernel32.NewProc("AllocConsole")
 	procGetStdHandle     = kernel32.NewProc("GetStdHandle")
 	procGetFileType      = kernel32.NewProc("GetFileType")
 	procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
+	procSetConsoleTitle  = kernel32.NewProc("SetConsoleTitleW")
 	user32               = syscall.NewLazyDLL("user32.dll")
 	procShowWindow       = user32.NewProc("ShowWindow")
+	procMessageBox       = user32.NewProc("MessageBoxW")
 )
 
 const (
@@ -137,12 +140,23 @@ const (
 	fileTypePipe        = 3
 	fileTypeDisk        = 4
 	swHide              = 0
+	mbIconInformation   = 0x00000040
+	mbIconWarning       = 0x00000030
+	mbIconQuestion      = 0x00000020
+	mbYesNo             = 0x00000004
+	idYes               = 6
+	// CreateProcess 的 CreationFlags：让新进程完全脱离当前控制台，
+	// 关掉向导窗口时守护进程不会跟着一起死。
+	detachedProcess       = 0x00000008
+	createNewProcessGroup = 0x00000200
 )
 
 // ensureConsole 为 GUI 子系统程序按需接上控制台。
 // 程序编译成 -H windowsgui（后台运行时不弹黑框）；被 cmd 双击或命令行调用时，
 // 这里再附着到父进程的控制台，提示符和输出就正常了。
 // 如果 stdout 已被重定向到文件或管道，则保持原样不动。
+// 找不到父控制台时（典型场景：资源管理器里直接双击 exe）自己开一个，
+// 否则所有提示都会写进无底洞，用户看到的只是「双击了没反应」。
 func ensureConsole() {
 	if h, _, _ := procGetStdHandle.Call(stdOutputHandle); h != 0 && h != ^uintptr(0) {
 		switch t, _, _ := procGetFileType.Call(h); t {
@@ -152,8 +166,15 @@ func ensureConsole() {
 			return
 		}
 	}
+	// 先试着借用父进程的控制台（从 cmd 里调用时走这条）。
 	if r, _, _ := procAttachConsole.Call(attachParentProcess); r == 0 {
-		return // 没有父控制台（比如开机自启），正常静默运行
+		// 没有父控制台：自己开一个，让提示能显示出来。
+		if r2, _, _ := procAllocConsole.Call(); r2 == 0 {
+			return
+		}
+	}
+	if title, err := syscall.UTF16PtrFromString("CampusPortal"); err == nil {
+		procSetConsoleTitle.Call(uintptr(unsafe.Pointer(title)))
 	}
 	if f, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
 		os.Stdout = f
@@ -161,6 +182,55 @@ func ensureConsole() {
 	}
 	if f, err := os.OpenFile("CONIN$", os.O_RDWR, 0); err == nil {
 		os.Stdin = f
+	}
+}
+
+// msgBox 弹一个原生提示框。用于没有控制台、又必须让用户看见信息的场合。
+func msgBox(text, caption string, warn bool) {
+	t, err1 := syscall.UTF16PtrFromString(text)
+	c, err2 := syscall.UTF16PtrFromString(caption)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	flags := uintptr(mbIconInformation)
+	if warn {
+		flags = mbIconWarning
+	}
+	procMessageBox.Call(0, uintptr(unsafe.Pointer(t)), uintptr(unsafe.Pointer(c)), flags)
+}
+
+// hasConsole 判断当前进程是否真的能往某个地方输出提示。
+func hasConsole() bool {
+	h, _, _ := procGetStdHandle.Call(stdOutputHandle)
+	if h == 0 || h == ^uintptr(0) {
+		return false
+	}
+	t, _, _ := procGetFileType.Call(h)
+	return t == fileTypeChar || t == fileTypePipe || t == fileTypeDisk
+}
+
+// pauseOnFail 由 -pause 打开：出错时停一下等回车，方便双击运行时看清原因。
+var pauseOnFail bool
+
+// fail 报告一个「没法继续」的原因。
+// 有控制台就打印并以非零码退出，没有就弹窗——直接双击 exe 的人
+// 看不到黑框，只能靠弹窗知道发生了什么。
+func fail(msg string) {
+	if hasConsole() {
+		fmt.Fprintln(os.Stderr, msg)
+		if pauseOnFail {
+			pauseBeforeExit()
+		}
+		return
+	}
+	msgBox(msg, "CampusPortal", true)
+}
+
+// pauseBeforeExit 让「双击 exe 里跑完就退」的场景留给用户看一眼的机会。
+func pauseBeforeExit() {
+	if hasConsole() {
+		fmt.Print("\n按回车键退出… ")
+		bufio.NewReader(os.Stdin).ReadString('\n')
 	}
 }
 
@@ -712,8 +782,10 @@ func main() {
 		ipFlag     = flag.String("ip", "", "配合 -setup：门户真实 IP")
 		bindFlag   = flag.String("bind", "", "配合 -setup：源地址")
 		portalFlag = flag.String("portal", "", "配合 -setup：登录接口完整地址")
+		pauseFlag  = flag.Bool("pause", false, "出错时先停下等回车，便于双击运行时看清原因")
 	)
 	flag.Parse()
+	pauseOnFail = *pauseFlag
 
 	// 交互类命令需要控制台输出；守护模式则隐藏窗口静默运行。
 	if *setupFlag || *diagFlag || *onceFlag || *installFlg || *uninstFlg {
@@ -749,11 +821,24 @@ func main() {
 	log := &Logger{path: filepath.Join(dir, logFile)}
 	cfg, err := loadConfig(dir)
 	if err != nil {
-		fmt.Println("读取配置失败:", err)
+		fail("读取配置失败: " + err.Error())
 		return
 	}
+
+	// 没配置过就双击 exe，是别人第一次用这个程序最常见的路径。
+	// 不给提示直接退出等于劝退，所以这里自己开个控制台跑一遍向导。
 	if strings.TrimSpace(cfg.Portal) == "" && !*setupFlag {
-		fmt.Println("还没配置登录接口，请先双击 1-设置账号密码.cmd")
+		ensureConsole()
+		if !hasConsole() {
+			fail("还没配置登录接口，没法开始守护。\n\n" +
+				"请先双击本程序（不是按右键「以管理员身份运行」），\n" +
+				"它会打开一个窗口，按提示填校园网认证地址、学号和密码。")
+			return
+		}
+		fmt.Println("检测到还没有配置过，先做一次初始化。")
+		fmt.Println()
+		doSetup(dir, cfg, *userFlag, *pwFlag, *ipFlag, *bindFlag, *portalFlag)
+		pauseBeforeExit()
 		return
 	}
 
@@ -764,11 +849,11 @@ func main() {
 
 	pass, err := readPassword(dir)
 	if err != nil {
-		fmt.Println(err)
+		fail("读取密码失败：" + err.Error() + "\n\n重新双击本程序可以重新设置一遍。")
 		return
 	}
 	if strings.TrimSpace(cfg.User) == "" {
-		fmt.Println("还没设置学号，请先双击 1-设置账号密码.cmd")
+		fail("还没设置学号。\n\n双击本程序，按提示填一遍即可。")
 		return
 	}
 	cfg.User = strings.TrimSpace(cfg.User)
@@ -801,6 +886,14 @@ func main() {
 	}
 
 	if !singleInstance() {
+		// 已经有一份在后台跑了。双击的人此刻什么都没发生，得告诉他去看托盘。
+		if !*diagFlag && !*onceFlag {
+			fail("CampusPortal 已经在后台运行了。\n\n" +
+				"看任务栏右下角的托盘区，有个 Wi-Fi 图标：\n" +
+				"绿色 = 在线，红色 = 已掉线，紫色 = 正在登录。\n" +
+				"右键它可以「立即连接」或查看上次检查时间。\n\n" +
+				"（图标可能被 Win11 收进了 ^ 溢出区里）")
+		}
 		return
 	}
 	writePID(dir)
@@ -918,6 +1011,12 @@ func doSetup(dir string, cfg Config, userFlag, pwFlag, ipFlag, bindFlag, portalF
 	if !okLogin {
 		fmt.Println("失败 ✗", msg)
 		log.Error("setup 测试登录失败: %s", msg)
+		fmt.Println()
+		fmt.Println("配置已经存下来了，但这次登录没成功。常见原因：")
+		fmt.Println("  · 认证地址填错（应该是 login.php 那一层，不是首页）")
+		fmt.Println("  · 密码错，或账号被临时锁定")
+		fmt.Println("  · 现在连着别的网络，根本到不了校园门户")
+		fmt.Println("改好之后重新双击本程序即可再来一次。")
 		return
 	}
 	time.Sleep(2 * time.Second)
@@ -927,7 +1026,64 @@ func doSetup(dir string, cfg Config, userFlag, pwFlag, ipFlag, bindFlag, portalF
 	} else {
 		fmt.Println("接口返回:", msg, "但探测仍失败:", d2)
 		log.Warn("setup 登录成功但探测失败: %s", d2)
+		fmt.Println()
+		fmt.Println("接口说登录成功了，但外网还是不通。多半是这台机器走了代理或 VPN，")
+		fmt.Println("或者认证服务器只放行特定网段。可以先用 -diag 看看细节。")
+		return
 	}
+
+	// 配通了就顺手把「开机自启 + 现在开始守护」办掉，
+	// 省得用户再去翻别的手册——他双击 exe 就是想让它开始干活。
+	fmt.Println()
+	fmt.Print("要现在设为开机自启并在后台开始守护吗？[Y/n]: ")
+	ans, _ := rd.ReadString('\n')
+	ans = strings.ToLower(strings.TrimSpace(ans))
+	if ans != "" && ans != "y" && ans != "yes" {
+		fmt.Println("好的，没有设自启。之后想补上，可以在命令提示符里运行：")
+		fmt.Println("    CampusPortal.exe -install")
+		fmt.Println("现在想马上后台跑一次，直接双击本程序即可（配置已经齐了）。")
+		return
+	}
+
+	if err := installAutostart(dir); err != nil {
+		fmt.Println("写开机自启失败:", err)
+		fmt.Println("（写入失败不影响下面的启动，下次重启后需要手动跑一次）")
+	} else {
+		fmt.Println("已设为开机自启。")
+	}
+
+	fmt.Println()
+	fmt.Println("=== 初始化完成 ===")
+	fmt.Println("程序会在后台运行，托盘区能看到一个 Wi-Fi 图标：")
+	fmt.Println("  绿色 = 在线    红色 = 已掉线    紫色 = 正在登录")
+	fmt.Println("右键那个图标可以「立即连接」、看上次检查时间、打开日志。")
+	fmt.Println()
+	fmt.Print("按回车键关闭这个窗口… ")
+	rd.ReadString('\n')
+
+	// 用 detached 的方式拉起守护进程，这样关掉这个控制台窗口它也不会跟着退出。
+	if err := startDetached(); err != nil {
+		fmt.Println("启动后台进程失败:", err)
+		fmt.Println("可以直接双击本程序再试一次。")
+		pauseBeforeExit()
+	}
+}
+
+// startDetached 以脱离当前控制台的方式启动自己，进入守护模式。
+func startDetached() error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(self)
+	cmd.Dir = exeDir()
+	// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP：新进程不继承本控制台，
+	// 窗口关掉也不会把它一起带走。
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: detachedProcess | createNewProcessGroup,
+		HideWindow:    true,
+	}
+	return cmd.Start()
 }
 
 // sleepOrWake 睡 sec 秒；期间若托盘点了「立即连接」，立刻返回 true。

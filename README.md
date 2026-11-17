@@ -75,7 +75,9 @@
    如果我不知道，你要先教我怎么在浏览器 F12 的 Network 面板里找到那个 login 接口。
 5. 运行 CampusPortal.exe -setup，问我要学号和密码（密码我自己输，不要打印到屏幕或日志里），
    然后确认它打印「成功 ✓」。
-6. 双击 3-设为开机自启.cmd 或等价的命令设置开机自启，
+6. 运行 CampusPortal.exe -setup，问我要学号和密码（密码我自己输，不要打印到屏幕或日志里），
+   然后确认它打印「成功 ✓」。
+7. 用 CampusPortal.exe -install 设置开机自启，
    然后用 reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v CampusPortal
    确认注册表项存在且指向刚装好的那个 exe。
 7. 最后运行 CampusPortal.exe -diag，把诊断结果贴给我；
@@ -88,7 +90,20 @@
 
 ## 快速开始
 
-### 1. 编译（或直接用 Release 里的 exe）
+### 只想用，不想编译：三步
+
+1. 从 [Releases](https://github.com/Zhengyici/CampusPortal/releases/latest) 下载 `CampusPortal.exe`，
+   放到一个固定目录，例如 `E:\CampusPortal\`（别放桌面，会误删）。
+2. **双击它**。程序检测到还没配置过，会自己打开一个窗口，依次问你三件事：
+   认证接口地址 → 学号 → 密码（不回显）。填完立刻测一次登录，看到「成功 ✓」就是配好了。
+   接着问你要不要设开机自启，直接回车就是「要」。
+3. 完成。程序已经在后台跑了，托盘区有个 Wi-Fi 图标：
+   绿色在线 / 红色掉线 / 紫色正在登录。右键有「立即连接」和上次检查时间。
+
+> 只想重新配一遍：双击 exe 即可；已有配置时会优先按原配置守护，
+> 想强制重配用 `CampusPortal.exe -setup`。
+
+### 从源码编译
 
 ```bash
 git clone https://github.com/Zhengyici/CampusPortal.git
@@ -98,29 +113,15 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o CampusPortal.exe .
 
 只需 Go 1.21+，无第三方依赖。
 
-### 2. 设置账号密码
+### 或者用脚本（功能同上，适合放进批处理里）
 
-双击 `1-设置账号密码.cmd`，依次输入：
-
-1. 认证接口地址（首次必填，见下方「怎么找认证接口」）
-2. 学号
-3. 密码（输入时不回显）
-
-脚本会立即测试一次登录，看到「成功 ✓」就说明配好了。
-
-或者命令行：
+仓库里的 `1-设置账号密码.cmd` 走的也是同一个 `-setup` 向导，
+`3-设为开机自启.cmd` 是同一个自启逻辑。命令行等价写法：
 
 ```powershell
 .\CampusPortal.exe -setup -portal https://认证服务器/ac_portal/login.php -u 你的学号
+.\CampusPortal.exe -install      # 开机自启
 ```
-
-### 3. 设为开机自启
-
-双击 `3-设为开机自启.cmd`。
-
-### 4. 完成
-
-以后开机自动在后台运行，掉线自动重连。查看状态双击 `2-检查状态.cmd`。
 
 ### 怎么找认证接口
 
@@ -289,7 +290,7 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 部分国产电脑管家会把新写入的 `HKCU\...\Run` 项自动挪进 `Run\XXXXDisabled`
 子键并加 `rem|` 前缀（等于禁用）；`schtasks` 在非管理员账户下也可能
 直接 `Access is denied`。开机自启默认走 `HKCU\...\Run`，
-如果哪天被管家禁了，重新双击 `3-设为开机自启.cmd` 即可。
+如果哪天被管家禁了，重新运行 `CampusPortal.exe -install` 即可。
 
 ---
 
@@ -348,14 +349,14 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 <details>
 <summary><b>掉线了但它没自动登录？</b></summary>
 
-先双击 `2-检查状态.cmd` 看 `[后台进程]`。没在跑就双击 `4-立即后台运行.cmd`。
+先看任务管理器里有没有 `CampusPortal.exe`。没在跑就双击一次程序本体。
 程序是单实例的（用命名互斥体保证），不会重复启动。
 </details>
 
 <details>
 <summary><b>提示「用户名或密码错误」？</b></summary>
 
-密码改过了或填错了。重新双击 `1-设置账号密码.cmd`。
+密码改过了或填错了。重新运行 `CampusPortal.exe -setup`。
 </details>
 
 <details>
@@ -432,7 +433,7 @@ Win11 默认把新图标收进溢出区。点任务栏右下角的 `^` 展开，
 - **只支持 Windows**。DPAPI 加密和 `windowsgui` 子系统都是 Windows 特性。
 - **只开箱支持 H3C `ac_portal`**。见「支持的认证系统」。
 - **开机自启依赖 `HKCU\...\Run` 注册表项**。如果哪天被管家禁了，
-  重新双击 `3-设为开机自启.cmd` 即可。
+  重新运行 `CampusPortal.exe -install` 即可。
 - **不处理 WiFi 层**。它是假设你已经连着校园 WiFi 才有意义；如果 WiFi 本身
   断了，需要你手动连回去（或另配自动重连）。
 - **不知道你的密码**。首次运行必须你自己输一遍。
