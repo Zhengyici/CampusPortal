@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	VERSION   = "1.1.0"
+	VERSION   = "1.1.1"
 	cfgFile   = "config.json"
 	secFile   = "secrets.dat"
 	logFile   = "portal.log"
