@@ -4,12 +4,12 @@
 
 **校园网自动登录守护程序**
 
-掉线自动重连 · 无浏览器 · 常驻内存 12 MB · 单文件零依赖
+掉线自动重连 · 托盘状态 · 无浏览器 · 常驻内存 5 MB · 单文件零依赖
 
 [![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)]()
 [![Size](https://img.shields.io/badge/Binary-6.0%20MB-success)]()
-[![Memory](https://img.shields.io/badge/RAM-12%20MB-brightgreen)]()
+[![Memory](https://img.shields.io/badge/RAM-5%20MB-brightgreen)]()
 [![Deps](https://img.shields.io/badge/Dependencies-0-success)]()
 [![License](https://img.shields.io/badge/License-MIT-blue)]()
 
@@ -27,17 +27,26 @@
 这个程序把这件事自动化了：常驻后台，定时探测，发现掉线就用已保存的账号密码
 自动重新登录。**不开浏览器、不弹窗、不打扰你。**
 
-> 实测：手动注销账号制造断网后，**10 秒内**自动恢复联网。
+托盘里有个小图标随时告诉你它还在不在线：
+
+![托盘三态](assets/tray-states.png)
+
+右键点它能看到上次检查时间，也能点「立即连接」当场登录一次：
+
+![托盘右键菜单](assets/tray-menu.png)
+
+> 实测：手动点「立即连接」后 **3 秒**完成登录并恢复联网；
+> 自动守护按 `interval_sec`（默认 1800 秒）轮询，掉线最迟一个轮询周期内被发现。
 
 ```
-2025-01-01 12:00:00 [WARN] 探测失败(#1)：www.baidu.com 内容不符（可能被劫持）
-2025-01-01 12:00:10 [INFO] 自动登录成功（logon success），网络已恢复
+2026-11-17 13:36:52 [INFO] 收到「立即连接」，强制登录一次
+2026-11-17 13:36:55 [INFO] 手动登录成功（logon success），网络已恢复
 ```
 
 ## 特性
 
 - **零依赖**：单个 6 MB 的 `.exe`，只用 Go 标准库，不需要装 Python / Node / 浏览器
-- **省资源**：常驻内存 17 MB，CPU 几乎不动（跑 2.5 分钟累计 0.1 s）
+- **省资源**：常驻内存约 5 MB（私有工作集 3 MB），CPU 几乎不动（跑 3 小时累计 1.7 s）
 - **静默**：编译为 `windowsgui` 子系统，无控制台窗口、无弹窗
 - **托盘状态**：任务栏托盘一个 Wi-Fi 图标，绿色=在线、红色=离线、紫色=正在登录；
   右键可看「上次检查时间」、点「立即连接」强制登录一次、打开日志、退出
@@ -68,10 +77,12 @@
    如果我不知道，你要先教我怎么在浏览器 F12 的 Network 面板里找到那个 login 接口。
 5. 运行 CampusPortal.exe -setup，问我要学号和密码（密码我自己输，不要打印到屏幕或日志里），
    然后确认它打印「成功 ✓」。
-6. 双击 3-设为开机自启.cmd 或等价的命令设置开机自启，并验证启动文件夹里的快捷方式存在。
+6. 双击 3-设为开机自启.cmd 或等价的命令设置开机自启，
+   然后用 reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v CampusPortal
+   确认注册表项存在且指向刚装好的那个 exe。
 7. 最后运行 CampusPortal.exe -diag，把诊断结果贴给我；
-   再手动去认证页面点一次「注销」制造掉线，等一分钟后看 portal.log
-   里有没有出现「自动登录成功」，确认守护真的生效。
+   再手动去认证页面点一次「注销」制造掉线，然后右键托盘图标点「立即连接」，
+   看 portal.log 里有没有出现「手动登录成功」，确认守护真的生效。
 8. 全程别把学号和密码写进任何会提交到 git 的文件。
 ````
 
@@ -130,6 +141,40 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o CampusPortal.exe .
 
 ## 使用
 
+### 托盘图标
+
+程序启动后会在任务栏托盘放一个 Wi-Fi 图标，颜色就是它的状态：
+
+| 图标 | 颜色 | 含义 |
+|:--:|:--|:--|
+| ![在线](assets/tray-online.png) | 绿色 | 在线，网络正常 |
+| ![离线](assets/tray-offline.png) | 红色 | 离线，探测失败或登录失败 |
+| ![登录中](assets/tray-busy.png) | 紫色 | 正在登录 |
+
+Windows 11 默认会把新出现的托盘图标收进溢出区，点任务栏右下角的 `^` 就能看到它：
+
+![在溢出区第一格](assets/tray-overflow.png)
+
+觉得每次都点 `^` 麻烦，可以直接把它从溢出区拖到任务栏上常驻。
+
+### 右键菜单
+
+![右键菜单](assets/tray-menu.png)
+
+| 菜单项 | 说明 |
+|:--|:--|
+| `状态：在线` / `离线` | 当前状态，置灰不可点 |
+| `上次检查：11-17 13:36:55（正常）` | 上一次探测的时间和结果 |
+| `本次运行已自动登录 N 次` | 从上次启动到现在，成功自动登录的次数 |
+| **`立即连接`** | 不管当前是否在线，强制走一遍登录接口 |
+| `打开日志` | 用记事本打开 `portal.log` |
+| `退出` | 停掉托盘和守护进程 |
+
+鼠标悬停在图标上会显示一行摘要，例如
+`CampusPortal · 在线｜上次检查 11-17 13:36｜已自动登录 1 次`。
+
+> 不想用托盘？加 `-notray` 参数启动，就退回纯静默后台模式。
+
 ### 图形化脚本
 
 | 文件 | 用途 |
@@ -152,6 +197,15 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o CampusPortal.exe .
 .\CampusPortal.exe -uninstall               # 删除注册表 Run 项
 .\CampusPortal.exe                          # 守护模式（正常后台运行）
 ```
+
+### 诊断
+
+`2-检查状态.cmd` 会跑一遍 `-diag`，输出长这样（账号和域名已脱敏）：
+
+![诊断输出](assets/diag.png)
+
+重点看三行：`RC4 自检` 要和括号里的期望值一致、`连通性` 要是 `true`、
+`门户可达` 要是 `OK`。哪一项不对，照着后面的提示改。
 
 ---
 
@@ -283,8 +337,10 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 | `config.json` | 配置（含门户地址，**不要提交**） |
 | `secrets.dat` | 密码，`CryptProtectData`（CurrentUser）加密，**不要提交** |
 | `portal.log` | 运行日志，超过 512 KB 自动轮转 |
+| `portal.state` | 托盘显示「上次检查时间」用，不含学号（**不要提交**） |
 | `main.go` | 守护循环、探测、登录、配置、DPAPI，约 1150 行 |
 | `tray.go` | 托盘图标与右键菜单，纯 Win32 手写，约 660 行 |
+| `assets/` | README 用的截图 |
 | `*.cmd` | 给不熟命令行的人准备的图形化操作脚本 |
 
 ---
@@ -337,7 +393,7 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 
 看托盘图标：绿色 = 在线，红色 = 离线，紫色 = 正在登录。
 右键菜单里有「上次检查时间」和「本次运行已自动登录 N 次」。
-也可以看 `portal.log`，每次自动恢复都会留一行 `自动登录成功（logon success）`。
+也可以看 `portal.log`，每次恢复都会留一行 `登录成功（logon success）`。
 </details>
 
 <details>
@@ -356,8 +412,12 @@ Win11 默认把新图标收进溢出区。点任务栏右下角的 `^` 展开，
 <details>
 <summary><b>开机自启会不会弹 SmartScreen「已保护你的电脑」？</b></summary>
 
-不会。`HKCU\...\Run` 走的是 CreateProcess 路径，不经过 SmartScreen 的文件检查。
-（只有双击 / 启动文件夹快捷方式这类 ShellExecute 路径才会被拦。）
+不会。这次改成了写 `HKCU\...\Run` 注册表项，由系统在登录后直接 `CreateProcess`
+拉起进程，不经过资源管理器的文件检查，也就不会触发 SmartScreen 的弹窗。
+
+如果你是从网上下载的 exe，第一次**手动双击**时仍然可能看到一次安全提示——
+那是下载来源标记（Mark of the Web）导致的，手动放过一次之后就再也不会出现，
+不影响以后的开机自启。
 </details>
 
 <details>
@@ -385,8 +445,8 @@ Win11 默认把新图标收进溢出区。点任务栏右下角的 `^` 展开，
 
 本项目仅用于自动化你自己账号的登录流程，不绕过任何认证、不共享账号、
 不修改学校系统。请遵守所在学校的网络使用规定。账号密码由你自行妥善保管，
-仓库已附带 `.gitignore` 排除 `secrets.dat` 与 `config.json`；
-请确认你没有把它们连同其他文件一起提交上去。
+仓库已附带 `.gitignore` 排除 `secrets.dat`、`config.json`、`portal.log`、
+`portal.state`；请确认你没有把它们连同其他文件一起提交上去。
 
 ## License
 

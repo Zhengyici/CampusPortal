@@ -956,7 +956,7 @@ func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-
 	// report 把一次探测结论同时写进日志、状态对象和 portal.state（重启后还能显示上次检查时间）
 	report := func(online bool, detail string, writeLog bool) {
 		st.set(online, detail)
-		saveState(stateFile, st, cfg)
+		saveState(stateFile, st)
 		if writeLog && online {
 			log.Info("探测正常：%s", detail)
 		}
@@ -971,7 +971,7 @@ func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-
 			if !okLogin {
 				log.Error("手动登录失败：%s", msg)
 				st.set(false, "手动登录失败："+msg)
-				saveState(stateFile, st, cfg)
+				saveState(stateFile, st)
 			} else {
 				sleepOrWake(wake, 2)
 				ok3, d3 := p.probe()
@@ -983,7 +983,7 @@ func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-
 				} else {
 					log.Warn("手动登录接口返回成功，但探测仍失败（%s）", d3)
 					st.set(false, d3)
-					saveState(stateFile, st, cfg)
+					saveState(stateFile, st)
 				}
 			}
 			sleepOrWake(wake, cfg.Interval)
@@ -1022,7 +1022,7 @@ func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-
 			w := backoff(cfg, authFails)
 			log.Error("登录失败：%s（%d 秒后重试）", msg, w)
 			st.set(false, msg)
-			saveState(stateFile, st, cfg)
+			saveState(stateFile, st)
 			sleepOrWake(wake, w)
 			continue
 		}
@@ -1039,24 +1039,25 @@ func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-
 			w := backoff(cfg, authFails)
 			log.Warn("登录接口返回成功但探测仍失败（%s），%d 秒后重试", d3, w)
 			st.set(false, d3)
-			saveState(stateFile, st, cfg)
+			saveState(stateFile, st)
 			sleepOrWake(wake, w)
 		}
 	}
 }
 
 // saveState 记下「上次检查时间 / 是否在线」，供下次启动时托盘直接显示。
-func saveState(path string, st *status, cfg Config) {
+func saveState(path string, st *status) {
 	online, checked, detail, _, _ := st.snapshot()
 	if checked.IsZero() {
 		return
 	}
+	// 故意不写 user：这个文件只给托盘显示「上次检查时间」用，
+	// 把学号写进去只会多一个可能被误提交的泄露面。
 	v := map[string]interface{}{
 		"checked": checked.Format("2006-01-02 15:04:05"),
 		"online":  online,
 		"detail":  detail,
 		"version": VERSION,
-		"user":    cfg.User,
 	}
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {

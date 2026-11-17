@@ -4,6 +4,7 @@ config.json
 portal.log
 portal.log.*
 portal.pid
+portal.state
 
 # 编译产物
 *.exe
