@@ -13,15 +13,17 @@ if not exist "secrets.dat" (
 tasklist /FI "IMAGENAME eq CampusPortal.exe" 2>nul | find /I "CampusPortal.exe" >nul
 if not errorlevel 1 (
     echo 它已经在后台跑了，不需要重复启动。
+    echo 需要立刻强制登录一次？右键任务栏托盘图标 - 立即连接。
     echo.
     pause
     exit /b 0
 )
-powershell -NoProfile -Command "Start-Process -FilePath (Join-Path '%~dp0' 'CampusPortal.exe') -WorkingDirectory '%~dp0'"
+start "" "%~dp0CampusPortal.exe"
 ping -n 4 127.0.0.1 >nul
 tasklist /FI "IMAGENAME eq CampusPortal.exe" 2>nul | find /I "CampusPortal.exe" >nul
 if not errorlevel 1 (
     echo 已在后台启动，无窗口，默默守护。
+    echo 托盘区（可能要点开 ^^ 展开）会多一个 Wi-Fi 图标，右键有菜单。
 ) else (
     echo [警告] 启动似乎失败，请把 portal.log 发给助手看看。
 )

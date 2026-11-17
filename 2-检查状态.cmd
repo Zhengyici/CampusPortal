@@ -7,10 +7,10 @@ echo ============================================
 echo.
 echo [后台进程]
 tasklist /FI "IMAGENAME eq CampusPortal.exe" 2>nul | find /I "CampusPortal.exe"
-if errorlevel 1 echo   未在运行
+if errorlevel 1 echo    未在运行
 echo.
 echo [开机自启]
-powershell -NoProfile -Command "$l=Join-Path ([Environment]::GetFolderPath('Startup')) 'CampusPortal.lnk'; if(Test-Path $l){ Write-Host '   已设置' } else { Write-Host '   未设置' }"
+powershell -NoProfile -Command "$v=(Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name CampusPortal -ErrorAction SilentlyContinue).CampusPortal; if($v){ Write-Host ('   已设置: ' + $v) } else { Write-Host '   未设置' }"
 echo.
 echo [诊断]
 CampusPortal.exe -diag

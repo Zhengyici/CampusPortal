@@ -27,13 +27,14 @@ import (
 )
 
 const (
-	VERSION = "1.0.0"
-	cfgFile = "config.json"
-	secFile = "secrets.dat"
-	logFile = "portal.log"
-	pidFile = "portal.pid"
-	logMax  = 512 * 1024
-	appID   = "CampusPortal"
+	VERSION   = "1.1.0"
+	cfgFile   = "config.json"
+	secFile   = "secrets.dat"
+	logFile   = "portal.log"
+	pidFile   = "portal.pid"
+	stateFile = "portal.state"
+	logMax    = 512 * 1024
+	appID     = "CampusPortal"
 )
 
 // ------------------------------------------------------------------ 配置
@@ -130,12 +131,12 @@ var (
 )
 
 const (
-	stdOutputHandle      = ^uintptr(11) // -11
-	attachParentProcess  = ^uintptr(0)  // -1
-	fileTypeChar         = 1
-	fileTypePipe         = 3
-	fileTypeDisk         = 4
-	swHide               = 0
+	stdOutputHandle     = ^uintptr(11) // -11
+	attachParentProcess = ^uintptr(0)  // -1
+	fileTypeChar        = 1
+	fileTypePipe        = 3
+	fileTypeDisk        = 4
+	swHide              = 0
 )
 
 // ensureConsole 为 GUI 子系统程序按需接上控制台。
@@ -482,6 +483,7 @@ func loginOnce(cfg Config, user, pass, targetIP, bindIP string, timeout time.Dur
 //  1. 固定门户 IP + 绑定源地址（绕开 Clash TUN，最干净）
 //  2. 固定门户 IP + 不绑定（应对源地址挑选失准）
 //  3. 域名解析 + 不绑定（应对门户换了 IP）
+//
 // 只要某一种拿到了 JSON（哪怕是“密码错误”），就立即返回，不再往下试。
 func login(cfg Config, user, pass string, timeout time.Duration) (bool, string) {
 	bindIP := cfg.BindLocalIP
@@ -704,6 +706,7 @@ func main() {
 		forceFlag  = flag.Bool("force", false, "配合 -diag：即使在线也强制调一次登录接口")
 		installFlg = flag.Bool("install", false, "设置开机自动启动")
 		uninstFlg  = flag.Bool("uninstall", false, "取消开机自动启动")
+		noTrayFlg  = flag.Bool("notray", false, "不显示托盘图标（纯后台静默）")
 		userFlag   = flag.String("u", "", "配合 -setup：学号")
 		pwFlag     = flag.String("pw", "", "配合 -setup：密码（不推荐，会留在命令历史）")
 		ipFlag     = flag.String("ip", "", "配合 -setup：门户真实 IP")
@@ -802,7 +805,26 @@ func main() {
 	}
 	writePID(dir)
 	defer os.Remove(filepath.Join(dir, pidFile))
-	daemon(p, cfg, pass, log)
+
+	st := &status{}
+	loadState(filepath.Join(dir, stateFile), st)
+
+	var wake chan struct{}
+	if !*noTrayFlg {
+		wake = make(chan struct{}, 1)
+		st.markBusy("启动中…")
+		go func() {
+			if err := runTray(st, wake, dir, log); err != nil {
+				// 托盘起不来（没有 explorer / 被策略禁掉）就当作纯后台跑，别让守护一起死掉
+				log.Warn("托盘图标创建失败，转为静默后台运行：%v", err)
+				st.set(false, "托盘不可用")
+			}
+		}()
+		// 给托盘一点时间先画出来，再开始第一轮探测
+		time.Sleep(600 * time.Millisecond)
+	}
+
+	daemon(p, cfg, pass, log, st, wake)
 }
 
 func doSetup(dir string, cfg Config, userFlag, pwFlag, ipFlag, bindFlag, portalFlag string) {
@@ -908,56 +930,162 @@ func doSetup(dir string, cfg Config, userFlag, pwFlag, ipFlag, bindFlag, portalF
 	}
 }
 
-func daemon(p *prober, cfg Config, pass string, log *Logger) {
+// sleepOrWake 睡 sec 秒；期间若托盘点了「立即连接」，立刻返回 true。
+func sleepOrWake(wake <-chan struct{}, sec int) (woken bool) {
+	if wake == nil {
+		time.Sleep(time.Duration(sec) * time.Second)
+		return false
+	}
+	t := time.NewTimer(time.Duration(sec) * time.Second)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return false
+	case <-wake:
+		return true
+	}
+}
+
+func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-chan struct{}) {
 	log.Info("守护启动 v%s：账号 %s，间隔 %ds，门户 %s (%s)，源地址 %s",
 		VERSION, cfg.User, cfg.Interval, cfg.Portal, cfg.PortalIP, orDash(cfg.BindLocalIP))
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	fails, authFails := 0, 0
-	sleep := func(sec int) { time.Sleep(time.Duration(sec) * time.Second) }
+	rounds := 0
+
+	// report 把一次探测结论同时写进日志、状态对象和 portal.state（重启后还能显示上次检查时间）
+	report := func(online bool, detail string, writeLog bool) {
+		st.set(online, detail)
+		saveState(stateFile, st, cfg)
+		if writeLog && online {
+			log.Info("探测正常：%s", detail)
+		}
+	}
 
 	for {
+		// 托盘点了「立即连接」：跳过探测，无条件强制登录一次
+		if st.consumeForce() {
+			log.Info("收到「立即连接」，强制登录一次")
+			st.markBusy("正在登录…")
+			okLogin, msg := login(cfg, cfg.User, pass, timeout)
+			if !okLogin {
+				log.Error("手动登录失败：%s", msg)
+				st.set(false, "手动登录失败："+msg)
+				saveState(stateFile, st, cfg)
+			} else {
+				sleepOrWake(wake, 2)
+				ok3, d3 := p.probe()
+				if ok3 {
+					log.Info("手动登录成功（%s），网络已恢复", msg)
+					st.countLogin()
+					fails, authFails = 0, 0
+					report(true, d3, false)
+				} else {
+					log.Warn("手动登录接口返回成功，但探测仍失败（%s）", d3)
+					st.set(false, d3)
+					saveState(stateFile, st, cfg)
+				}
+			}
+			sleepOrWake(wake, cfg.Interval)
+			continue
+		}
+
 		ok, detail := p.probe()
+		rounds++
 		if ok {
 			if fails > 0 {
 				log.Info("网络已恢复正常")
 			}
 			fails, authFails = 0, 0
-			sleep(cfg.Interval)
+			// 心跳：每 8 轮（间隔 30 分钟时约 4 小时）写一行，证明进程还活着
+			report(true, detail, rounds%8 == 1)
+			sleepOrWake(wake, cfg.Interval)
 			continue
 		}
 
 		fails++
 		log.Warn("探测失败(#%d)：%s", fails, detail)
 
-		sleep(3) // 二次确认，滤掉瞬时抖动
-		if ok2, _ := p.probe(); ok2 {
+		sleepOrWake(wake, 3) // 二次确认，滤掉瞬时抖动
+		if ok2, d2 := p.probe(); ok2 {
 			log.Info("二次探测通过，判为瞬时抖动，忽略")
 			fails = 0
-			sleep(cfg.Interval)
+			report(true, d2, false)
+			sleepOrWake(wake, cfg.Interval)
 			continue
 		}
 
+		st.markBusy("正在登录…")
 		okLogin, msg := login(cfg, cfg.User, pass, timeout)
 		if !okLogin {
 			authFails++
 			w := backoff(cfg, authFails)
 			log.Error("登录失败：%s（%d 秒后重试）", msg, w)
-			sleep(w)
+			st.set(false, msg)
+			saveState(stateFile, st, cfg)
+			sleepOrWake(wake, w)
 			continue
 		}
 
-		sleep(2)
+		sleepOrWake(wake, 2)
 		if ok3, d3 := p.probe(); ok3 {
 			log.Info("自动登录成功（%s），网络已恢复", msg)
+			st.countLogin()
 			fails, authFails = 0, 0
-			sleep(cfg.Interval)
+			report(true, d3, false)
+			sleepOrWake(wake, cfg.Interval)
 		} else {
 			authFails++
 			w := backoff(cfg, authFails)
 			log.Warn("登录接口返回成功但探测仍失败（%s），%d 秒后重试", d3, w)
-			sleep(w)
+			st.set(false, d3)
+			saveState(stateFile, st, cfg)
+			sleepOrWake(wake, w)
 		}
 	}
+}
+
+// saveState 记下「上次检查时间 / 是否在线」，供下次启动时托盘直接显示。
+func saveState(path string, st *status, cfg Config) {
+	online, checked, detail, _, _ := st.snapshot()
+	if checked.IsZero() {
+		return
+	}
+	v := map[string]interface{}{
+		"checked": checked.Format("2006-01-02 15:04:05"),
+		"online":  online,
+		"detail":  detail,
+		"version": VERSION,
+		"user":    cfg.User,
+	}
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, b, 0o644)
+}
+
+// loadState 启动时把上次的检查结果读回来，避免托盘一上来显示「尚未检查」。
+func loadState(path string, st *status) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var v struct {
+		Checked string `json:"checked"`
+		Online  bool   `json:"online"`
+		Detail  string `json:"detail"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", v.Checked, time.Local)
+	if err != nil {
+		return
+	}
+	st.mu.Lock()
+	st.online, st.checked, st.detail = v.Online, t, v.Detail
+	st.mu.Unlock()
 }
 
 func runDiag(p *prober, cfg Config, pass string, force bool) {

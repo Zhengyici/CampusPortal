@@ -15,12 +15,24 @@ if not exist "secrets.dat" (
     pause
     exit /b 1
 )
-echo 正在创建开机启动快捷方式...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$d='%~dp0'.TrimEnd('\'); $s=[Environment]::GetFolderPath('Startup'); $l=Join-Path $s 'CampusPortal.lnk'; $w=New-Object -ComObject WScript.Shell; $k=$w.CreateShortcut($l); $k.TargetPath=Join-Path $d 'CampusPortal.exe'; $k.WorkingDirectory=$d; $k.WindowStyle=7; $k.Description='校园网自动登录守护'; $k.Save(); if(Test-Path $l){'OK'}else{'FAIL'}"
+
+echo 正在写入注册表启动项...
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v CampusPortal /t REG_SZ /d "\"%~dp0CampusPortal.exe\"" /f >nul
+if errorlevel 1 (
+    echo [错误] 写入注册表失败。
+    pause
+    exit /b 1
+)
+
+echo 清理旧的启动文件夹快捷方式...
+powershell -NoProfile -Command "$l=Join-Path ([Environment]::GetFolderPath('Startup')) 'CampusPortal.lnk'; if(Test-Path $l){ Remove-Item $l -Force; Write-Host '  旧快捷方式: 已删除' } else { Write-Host '  旧快捷方式: 无' }"
+
 echo.
-powershell -NoProfile -Command "$l=Join-Path ([Environment]::GetFolderPath('Startup')) 'CampusPortal.lnk'; if(Test-Path $l){ $w=New-Object -ComObject WScript.Shell; $k=$w.CreateShortcut($l); Write-Host ('启动项: ' + $k.TargetPath) } else { Write-Host '启动项: 创建失败' }"
+reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v CampusPortal
 echo.
-echo 成功：以后开机登录 Windows，它会自动在后台静默运行，不弹窗。
+echo 成功：以后开机登录 Windows，它会自动在后台静默运行，不弹窗、不打扰。
+echo.
+echo 注意：请保持本文件夹位置不变。一旦挪动，请重新运行本脚本。
 echo.
 tasklist /FI "IMAGENAME eq CampusPortal.exe" 2>nul | find /I "CampusPortal.exe" >nul
 if not errorlevel 1 (
@@ -29,7 +41,7 @@ if not errorlevel 1 (
 )
 echo 现在就在后台启动它吗？按任意键启动，直接关窗口则跳过
 pause >nul
-powershell -NoProfile -Command "Start-Process -FilePath (Join-Path '%~dp0' 'CampusPortal.exe') -WorkingDirectory '%~dp0'"
+start "" "%~dp0CampusPortal.exe"
 ping -n 4 127.0.0.1 >nul
 tasklist /FI "IMAGENAME eq CampusPortal.exe" 2>nul | find /I "CampusPortal.exe" >nul
 if not errorlevel 1 (

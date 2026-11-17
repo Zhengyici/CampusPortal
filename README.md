@@ -37,8 +37,10 @@
 ## 特性
 
 - **零依赖**：单个 6 MB 的 `.exe`，只用 Go 标准库，不需要装 Python / Node / 浏览器
-- **省资源**：常驻内存 12 MB，CPU 几乎不动（跑 2.5 分钟累计 0.1 s）
-- **静默**：编译为 `windowsgui` 子系统，无控制台窗口、无托盘图标
+- **省资源**：常驻内存 17 MB，CPU 几乎不动（跑 2.5 分钟累计 0.1 s）
+- **静默**：编译为 `windowsgui` 子系统，无控制台窗口、无弹窗
+- **托盘状态**：任务栏托盘一个 Wi-Fi 图标，绿色=在线、红色=离线、紫色=正在登录；
+  右键可看「上次检查时间」、点「立即连接」强制登录一次、打开日志、退出
 - **抗劫持**：不只看 HTTP 200，还校验页面内容，识破网关返回的假 200 认证页
 - **抗干扰**：可绕开 Clash / mihomo 的 TUN + fake-ip，直连门户真实 IP
 - **密码安全**：用 Windows DPAPI 加密存储，换机器 / 换用户解不开
@@ -134,7 +136,7 @@ go build -trimpath -ldflags "-s -w -H windowsgui" -o CampusPortal.exe .
 |:--|:--|
 | `1-设置账号密码.cmd` | 首次配置 / 改密码，会顺便测试登录 |
 | `2-检查状态.cmd` | 进程、自启、连通性、诊断、最近日志 |
-| `3-设为开机自启.cmd` | 开机自启（往「启动」文件夹放快捷方式） |
+| `3-设为开机自启.cmd` | 开机自启（写 `HKCU\...\Run` 注册表项） |
 | `4-立即后台运行.cmd` | 手动启动 |
 | `5-取消开机自启并停止.cmd` | 撤销全部设置 |
 
@@ -234,8 +236,8 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 
 部分国产电脑管家会把新写入的 `HKCU\...\Run` 项自动挪进 `Run\XXXXDisabled`
 子键并加 `rem|` 前缀（等于禁用）；`schtasks` 在非管理员账户下也可能
-直接 `Access is denied`。所以本项目的开机自启走的是**「启动」文件夹放快捷方式**，
-那个位置管家一般不管。
+直接 `Access is denied`。开机自启默认走 `HKCU\...\Run`，
+如果哪天被管家禁了，重新双击 `3-设为开机自启.cmd` 即可。
 
 ---
 
@@ -281,7 +283,8 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 | `config.json` | 配置（含门户地址，**不要提交**） |
 | `secrets.dat` | 密码，`CryptProtectData`（CurrentUser）加密，**不要提交** |
 | `portal.log` | 运行日志，超过 512 KB 自动轮转 |
-| `main.go` | 全部源码，约 1000 行 |
+| `main.go` | 守护循环、探测、登录、配置、DPAPI，约 1150 行 |
+| `tray.go` | 托盘图标与右键菜单，纯 Win32 手写，约 660 行 |
 | `*.cmd` | 给不熟命令行的人准备的图形化操作脚本 |
 
 ---
@@ -332,7 +335,29 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 <details>
 <summary><b>怎么知道它真的在干活？</b></summary>
 
-看 `portal.log`。每次自动恢复都会留一行 `自动登录成功（logon success）`。
+看托盘图标：绿色 = 在线，红色 = 离线，紫色 = 正在登录。
+右键菜单里有「上次检查时间」和「本次运行已自动登录 N 次」。
+也可以看 `portal.log`，每次自动恢复都会留一行 `自动登录成功（logon success）`。
+</details>
+
+<details>
+<summary><b>想立刻登录一次，不想等 30 分钟？</b></summary>
+
+右键托盘图标 → **立即连接**。它会跳过探测，无条件走一遍登录接口。
+</details>
+
+<details>
+<summary><b>托盘图标找不到？</b></summary>
+
+Win11 默认把新图标收进溢出区。点任务栏右下角的 `^` 展开，
+里面第一个 Wi-Fi 图标就是它，可以拖到任务栏上固定显示。
+</details>
+
+<details>
+<summary><b>开机自启会不会弹 SmartScreen「已保护你的电脑」？</b></summary>
+
+不会。`HKCU\...\Run` 走的是 CreateProcess 路径，不经过 SmartScreen 的文件检查。
+（只有双击 / 启动文件夹快捷方式这类 ShellExecute 路径才会被拦。）
 </details>
 
 <details>
@@ -348,7 +373,7 @@ Clash / mihomo 的 TUN 模式下系统 DNS 走 fake-ip，内网门户域名可�
 
 - **只支持 Windows**。DPAPI 加密和 `windowsgui` 子系统都是 Windows 特性。
 - **只开箱支持 H3C `ac_portal`**。见「支持的认证系统」。
-- **开机自启依赖「启动」文件夹**。如果哪天被管家禁了，
+- **开机自启依赖 `HKCU\...\Run` 注册表项**。如果哪天被管家禁了，
   重新双击 `3-设为开机自启.cmd` 即可。
 - **不处理 WiFi 层**。它是假设你已经连着校园 WiFi 才有意义；如果 WiFi 本身
   断了，需要你手动连回去（或另配自动重连）。
