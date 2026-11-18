@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	VERSION   = "1.1.1"
+	VERSION   = "1.1.2"
 	cfgFile   = "config.json"
 	secFile   = "secrets.dat"
 	logFile   = "portal.log"
@@ -78,7 +78,10 @@ func defaultConfig() Config {
 			"百度一下",
 			"Microsoft Connect Test",
 		},
-		Interval:   1800,
+		// 10 分钟一轮：实测每轮探测约 0.14 秒 CPU、2.3 KB 流量，
+		// 一天 144 轮合计不到 2 秒 CPU、335 KB，占用可以忽略；
+		// 换来的是掉线最多 10 分钟就被发现（原来是 30 分钟）。
+		Interval:   600,
 		Timeout:    8,
 		MaxBackoff: 300,
 	}
@@ -549,13 +552,95 @@ func loginOnce(cfg Config, user, pass, targetIP, bindIP string, timeout time.Dur
 	return false, lr.Msg, nil
 }
 
-// login 按“最稳妥到最宽松”的顺序尝试几种连法，取第一个拿到门户 JSON 应答的：
+// isTransient 判断这次失败的成因是「链路抖动」还是「配置/账号本身有问题」。
+//
+// 区分这两类很重要：密码错、地址写错，重试多少次都没用；
+// 而校园 WiFi 断链重连的那几秒里，报文会石沉大海，
+// 表现就是 context deadline exceeded / EOF / connection reset，等几秒就好。
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, k := range []string{
+		"eof",
+		"timeout",
+		"timed out",
+		"deadline exceeded",
+		"connection reset",
+		"connection refused",
+		"forcibly closed",
+		"broken pipe",
+		"network is unreachable",
+		"no route to host",
+		"tls handshake",
+		"wsarecv",
+		"wsasend",
+	} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// login 在 loginPass 外面套一层重试。
+//
+// 起因：2026-11-18 11:57 手动点「立即连接」时三种连法全失败，日志是
+// 一次 context deadline exceeded 加两次 EOF。查 Windows 事件日志发现
+// 11:58:40 正好有一次 WLAN 断开重连，也就是说失败发生在网卡断链的窗口里。
+// 这种抖动过几秒就恢复，多试两次即可，没必要让用户以为程序坏了。
+//
+// 只对「链路类」错误重试；门户明确回了 JSON（密码错、账号锁定）就立刻收手。
+// 重试有总时长上限，避免校园网长时间断着时一次登录卡上一分多钟。
+func login(cfg Config, user, pass string, timeout time.Duration) (bool, string) {
+	const (
+		maxAttempts = 3
+		totalBudget = 40 * time.Second
+	)
+	deadline := time.Now().Add(totalBudget)
+	msg := ""
+	retried := 0
+
+	for i := 1; i <= maxAttempts; i++ {
+		ok, m, transient := loginPass(cfg, user, pass, timeout)
+		msg = m
+		if ok || !transient {
+			if retried > 0 {
+				return ok, fmt.Sprintf("%s（第 %d 次尝试成功）", msg, i)
+			}
+			return ok, msg
+		}
+		if i == maxAttempts {
+			break
+		}
+		pause := time.Duration(2*i) * time.Second // 2s、4s
+		if time.Now().Add(pause).After(deadline) {
+			break
+		}
+		retried++
+		time.Sleep(pause)
+	}
+	if retried > 0 {
+		return false, fmt.Sprintf("%s（链路抖动，已重试 %d 次仍不通）", msg, retried)
+	}
+	return false, msg
+}
+
+// loginPass 按“最稳妥到最宽松”的顺序尝试几种连法，取第一个拿到门户 JSON 应答的：
 //  1. 固定门户 IP + 绑定源地址（绕开 Clash TUN，最干净）
 //  2. 固定门户 IP + 不绑定（应对源地址挑选失准）
 //  3. 域名解析 + 不绑定（应对门户换了 IP）
 //
 // 只要某一种拿到了 JSON（哪怕是“密码错误”），就立即返回，不再往下试。
-func login(cfg Config, user, pass string, timeout time.Duration) (bool, string) {
+// 第三个返回值表示「全部连法都因为链路原因失败」，调用方可据此决定要不要重试。
+func loginPass(cfg Config, user, pass string, timeout time.Duration) (bool, string, bool) {
 	bindIP := cfg.BindLocalIP
 	if bindIP == "" && cfg.PortalIP != "" {
 		bindIP = autoBindIP(cfg.PortalIP)
@@ -576,14 +661,18 @@ func login(cfg Config, user, pass string, timeout time.Duration) (bool, string) 
 	attempts = append(attempts, attempt{"域名解析", "", ""})
 
 	var errs []string
+	allTransient := true
 	for _, a := range attempts {
 		ok, msg, err := loginOnce(cfg, user, pass, a.target, a.bind, timeout)
 		if err == nil {
-			return ok, msg // 门户正常应答了，结论有效
+			return ok, msg, false // 门户正常应答了，结论有效
+		}
+		if !isTransient(err) {
+			allTransient = false
 		}
 		errs = append(errs, a.name+"："+short(err))
 	}
-	return false, "连不上门户（" + strings.Join(errs, "；") + "）"
+	return false, "连不上门户（" + strings.Join(errs, "；") + "）", allTransient
 }
 
 // ------------------------------------------------------------------ 文件
@@ -1153,7 +1242,7 @@ func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-
 				log.Info("网络已恢复正常")
 			}
 			fails, authFails = 0, 0
-			// 心跳：每 8 轮（间隔 30 分钟时约 4 小时）写一行，证明进程还活着
+			// 心跳：每 8 轮（间隔 10 分钟时约 80 分钟）写一行，证明进程还活着
 			report(true, detail, rounds%8 == 1)
 			sleepOrWake(wake, cfg.Interval)
 			continue
@@ -1179,7 +1268,17 @@ func daemon(p *prober, cfg Config, pass string, log *Logger, st *status, wake <-
 			log.Error("登录失败：%s（%d 秒后重试）", msg, w)
 			st.set(false, msg)
 			saveState(stateFile, st)
-			sleepOrWake(wake, w)
+			// 链路抖动（WiFi 断链、漫游）和账号问题要区别对待：
+			// 前者往往几十秒内自己就好，用短周期再探一次即可；
+			// 后者按指数退避拖长，免得一直拿错密码去撞门户。
+			resume := w
+			if strings.Contains(msg, "链路抖动") {
+				resume = 30
+				if w < resume {
+					resume = w
+				}
+			}
+			sleepOrWake(wake, resume)
 			continue
 		}
 
